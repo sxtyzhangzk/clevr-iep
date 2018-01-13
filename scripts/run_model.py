@@ -11,13 +11,23 @@ import shutil
 import sys
 import os
 
+#import plotly.offline as py
+#import plotly.graph_objs as go
+
+import seaborn
+import matplotlib.pyplot as plt
+
 import torch
 from torch.autograd import Variable
 import torch.nn.functional as F
 import torchvision
 import numpy as np
 import h5py
-from scipy.misc import imread, imresize
+from scipy.misc import imread, imresize, imsave
+
+import scipy.interpolate as ip
+
+# import cv2
 
 import iep.utils as utils
 import iep.programs
@@ -58,9 +68,10 @@ parser.add_argument('--temperature', default=1.0, type=float)
 # If this is passed, then save all predictions to this file
 parser.add_argument('--output_h5', default=None)
 
+parser.add_argument('--focus_data', default=None)
+parser.add_argument('--focus_img', default=None)
 
-def main(args):
-  print()
+def init_model(args):
   model = None
   if args.baseline_model is not None:
     print('Loading baseline model from ', args.baseline_model)
@@ -79,6 +90,14 @@ def main(args):
     model = (program_generator, execution_engine)
   else:
     print('Must give either --baseline_model or --program_generator and --execution_engine')
+    return None
+  return model
+
+
+def main(args):
+  print()
+  model = init_model(args)
+  if model is None:
     return
 
   if args.question is not None and args.image is not None:
@@ -111,27 +130,34 @@ def load_vocab(args):
   return utils.load_cpu(path)['vocab']
 
 
-def run_single_example(args, model):
+def run_single_example(args, model, cnn_in=None):
   dtype = torch.FloatTensor
   if args.use_gpu == 1:
     dtype = torch.cuda.FloatTensor
 
   # Build the CNN to use for feature extraction
-  print('Loading CNN for feature extraction')
-  cnn = build_cnn(args, dtype)
+  if cnn_in is None:
+    print('Loading CNN for feature extraction')
+    cnn = build_cnn(args, dtype)
+  else:
+    cnn = cnn_in
 
   # Load and preprocess the image
   img_size = (args.image_height, args.image_width)
+  # print(img_size)
   img = imread(args.image, mode='RGB')
   img = imresize(img, img_size, interp='bicubic')
+  imsave("resized.png", img)
+  img_hm = img
   img = img.transpose(2, 0, 1)[None]
   mean = np.array([0.485, 0.456, 0.406]).reshape(1, 3, 1, 1)
   std = np.array([0.229, 0.224, 0.224]).reshape(1, 3, 1, 1)
   img = (img.astype(np.float32) / 255.0 - mean) / std
 
   # Use CNN to extract features for the image
-  img_var = Variable(torch.FloatTensor(img).type(dtype), volatile=True)
+  img_var = Variable(torch.FloatTensor(img).type(dtype), volatile=False, requires_grad=True)
   feats_var = cnn(img_var)
+  # print(feats_var)
 
   # Tokenize the question
   vocab = load_vocab(args)
@@ -143,12 +169,38 @@ def run_single_example(args, model):
                        allow_unk=True)
   question_encoded = torch.LongTensor(question_encoded).view(1, -1)
   question_encoded = question_encoded.type(dtype).long()
-  question_var = Variable(question_encoded, volatile=True)
+  question_var = Variable(question_encoded, volatile=False)
 
   # Run the model
   print('Running the model\n')
   scores = None
   predicted_program = None
+
+  GMAP_W = 14
+  GMAP_H = 14
+
+  IMG_W = 320
+  IMG_H = 240
+
+  # gm_ffm = [[0 for j in range(GMAP_W)] for i in range(GMAP_H)]
+  # gm_cnn = [[0 for j in range(GMAP_W)] for i in range(GMAP_H)]
+  gm_ffm = np.zeros([GMAP_H, GMAP_W])
+
+  def hook(gmap, layers, grad):
+    # print(grad)
+    data = grad.data.cpu()
+    maxvalue = 0
+    for i in range(GMAP_H):
+      for j in range(GMAP_W):
+        for k in range(layers):
+          gmap[i][j] = gmap[i][j] + data[0][k][i][j]
+        if abs(gmap[i][j]) > maxvalue:
+          maxvalue = abs(gmap[i][j])
+    # print("maxvalue=", maxvalue)
+    for i in range(GMAP_H):
+      for j in range(GMAP_W):
+        gmap[i][j] = abs(gmap[i][j] / maxvalue)
+  
   if type(model) is tuple:
     program_generator, execution_engine = model
     program_generator.type(dtype)
@@ -157,10 +209,119 @@ def run_single_example(args, model):
                           question_var,
                           temperature=args.temperature,
                           argmax=(args.sample_argmax == 1))
-    scores = execution_engine(feats_var, predicted_program)
+    scores, ffm = execution_engine(feats_var, predicted_program)
+    ffm.register_hook(lambda grad: hook(gm_ffm, 128, grad))
+
   else:
     model.type(dtype)
     scores = model(question_var, feats_var)
+    feats_var.register_hook(lambda grad: hook(gm_ffm, 1024, grad))
+
+  print("SCORES=", scores[0][0])
+
+  # fv = feats_var.transpose(1, 3)
+  # print(fv)
+
+  # feats_var.register_hook(lambda grad: hook(gm_cnn, 1024, grad))
+  # fv[0][0][0].sum().backward()
+  
+  sum = scores.sum()
+  sum.backward()
+
+  x = np.zeros([GMAP_H, GMAP_W])
+  y = np.zeros([GMAP_H, GMAP_W])
+  # # x = [(i + 0.5) / GMAP_H * IMG_H for i in range(GMAP_H)]
+  # # y = [(i + 0.5) / GMAP_H * IMG_W for i in range(GMAP_W)]
+
+  z = np.zeros([GMAP_H, GMAP_W])
+ 
+  for i in range(GMAP_H):
+    for j in range(GMAP_W):
+      x[i][j] = (i) #/ (GMAP_H-1)
+      y[i][j] = (j) #/ (GMAP_W-1)
+      z[i][j] = gm_ffm[i][j]
+  #print(x.max())
+  #print(y.max())
+
+  x.reshape([-1])
+  y.reshape([-1])
+  z.reshape([-1])
+  
+  # # x_new = np.zeros([IMG_H * IMG_W])
+  # # y_new = np.zeros([IMG_H * IMG_W])
+
+  x_new = [i + 0.5 for i in range(IMG_H)]
+  y_new = [i + 0.5 for i in range(IMG_W)]
+
+  # # for i in range(IMG_H):
+  # #   for j in range(IMG_W):
+  # #     x_new[i * IMG_W + j] = i + 0.5
+  # #     y_new[i * IMG_W + j] = j + 0.5 
+  # # print(x_new.size)
+  #x,y=np.mgrid(0:IMG_W:14j,0:IMG_H:14j)
+
+  f = ip.RectBivariateSpline([(i+0.5) / (GMAP_H) for i in range(GMAP_H)], [(i+0.5) / (GMAP_W) for i in range(GMAP_W)], z)
+  # f = ip.interp2d(x, y, z, kind='linear', fill_value=0, bounds_error=True)
+  # z_new = f(x_new, y_new)
+  z_new = np.zeros([IMG_H, IMG_W])
+  for i in range(IMG_H):  
+    for j in range(IMG_W):
+      z_new[i][j] = f((i + 0.5) / IMG_H, (j+0.5) / IMG_W)[0]
+  
+  if args.focus_data is not None:
+    with open(args.focus_data, 'w') as f:
+      for row in z_new:
+        for d in row:
+          f.write(str(d))
+          f.write(' ')
+        f.write('\n')
+
+  fimg = np.zeros([IMG_H, IMG_W, 3])
+  for i in range(IMG_H):
+    for j in range(IMG_W):
+      val = z_new[i][j] * 255
+      fimg[i][j] = [val, val, val]
+  if args.focus_img is not None:
+    imsave(args.focus_img, fimg)
+  # tck = ip.bisplrep(x, y, z, s=0)
+  # z_new = ip.bisplev(x_new, y_new, tck)
+
+  #z_new.reshape([IMG_H, IMG_W])
+  #print(z.max())
+  #print(z_new.max())
+  # print(z_new)
+
+  # plt.pcolor(z)
+  # plt.show()
+  # plt.pcolor(z_new)
+  # plt.show()
+
+  # print(gm_ffm)
+
+  # himg = np.array(gmap, dtype=np.float32)
+  # himg = imresize(himg, img_size, interp='bicubic')
+  # img_ffm = np.zeros([args.image_height, args.image_width, 3])
+  # img_cnn = np.zeros([args.image_height, args.image_width, 3])
+
+  # scale_h = args.image_height / GMAP_H
+  # scale_w = args.image_width / GMAP_W
+  # for i in range(args.image_height):
+  #   for j in range(args.image_width):
+  #     for k in range(3):
+  #       img_ffm[i][j][k] = img_hm[i][j][k] * 0.5 + gm_ffm[int(i / scale_h)][int(j / scale_w)] * 255 * 0.5
+  #       img_cnn[i][j][k] = img_hm[i][j][k] * 0.5 + gm_cnn[int(i / scale_h)][int(j / scale_w)] * 255 * 0.5
+  
+  # imsave('heatmap-ffm.png', img_ffm)
+  # imsave('heatmap-cnn.png', img_cnn)
+
+  # print(himg)
+
+  # seaborn.heatmap(gm_ffm)
+  # plt.show()
+
+  # print("GRADIENT=", ffm.grad)
+
+  # print(scores.backward(ffm))
 
   # Print results
   _, predicted_answer_idx = scores.data.cpu()[0].max(dim=0)

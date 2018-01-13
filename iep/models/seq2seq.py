@@ -50,7 +50,9 @@ class Seq2Seq(nn.Module):
     D = self.encoder_embed.embedding_dim
     H = self.encoder_rnn.hidden_size
     L = self.encoder_rnn.num_layers
-
+    
+    # print("X=", x)
+    # print("Y=", y)
     N = x.size(0) if x is not None else None
     N = y.size(0) if N is None and y is not None else N
     T_in = x.size(1) if x is not None else None
@@ -157,21 +159,25 @@ class Seq2Seq(nn.Module):
     return y
 
   def reinforce_sample(self, x, max_length=30, temperature=1.0, argmax=False):
+    # print("sample, x=", x)
     N, T = x.size(0), max_length
     encoded = self.encoder(x)
     y = torch.LongTensor(N, T).fill_(self.NULL)
     done = torch.ByteTensor(N).fill_(0)
     cur_input = Variable(x.data.new(N, 1).fill_(self.START))
+
     h, c = None, None
     self.multinomial_outputs = []
     self.multinomial_probs = []
     for t in range(T):
       # logprobs is N x 1 x V
+      # print("sample, cur_input=", cur_input)
       logprobs, h, c = self.decoder(encoded, cur_input, h0=h, c0=c)
       logprobs = logprobs / temperature
       probs = F.softmax(logprobs.view(N, -1)) # Now N x V
       if argmax:
         _, cur_output = probs.max(1)
+        cur_output = cur_output.unsqueeze(0)
       else:
         cur_output = probs.multinomial() # Now N x 1
       self.multinomial_outputs.append(cur_output)

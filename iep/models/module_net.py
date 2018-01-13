@@ -70,6 +70,7 @@ def build_classifier(module_C, module_H, module_W, num_answers,
       layers.append(nn.Dropout(p=dropout))
     prev_dim = next_dim
   layers.append(nn.Linear(prev_dim, num_answers))
+  print("LAYERS=", layers)
   return nn.Sequential(*layers)
 
 
@@ -228,16 +229,25 @@ class ModuleNet(nn.Module):
     N = x.size(0)
     assert N == len(program)
 
+   # print(x)
+
     feats = self.stem(x)
 
+    print(type(program))
     if type(program) is list or type(program) is tuple:
       final_module_outputs = self._forward_modules_json(feats, program)
     elif type(program) is Variable and program.dim() == 2:
       final_module_outputs = self._forward_modules_ints(feats, program)
     else:
       raise ValueError('Unrecognized program format')
+  #  print(final_module_outputs)
+
+  #  print(final_module_outputs.requires_grad)
 
     # After running modules for each input, concatenat the outputs from the
     # final module and run the classifier.
     out = self.classifier(final_module_outputs)
-    return out
+
+    # raise "FUCK YOU"
+
+    return out, final_module_outputs
